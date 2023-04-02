@@ -1,0 +1,765 @@
+---
+title: "PacBio 16S Amplicon sequencing analysis"
+author: Aiswarya Prasad
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  prettydoc::html_pretty:
+    theme: cayman
+    <!-- other fun themes: architect leonids hpstr cayman -->
+    highlight: github
+    math: katex
+    number_sections: true
+    df_print: paged
+    cold-folding: hide
+    toc: true
+---
+
+# Setup
+
+```{r setup}
+library(tidyverse)
+library(ggplot2)
+library(readxl)
+library(tidyverse)
+library(viridis)
+library(hrbrthemes)
+library(ggthemes)
+library(RColorBrewer)
+library(scales)
+library(dplyr)
+library(vegan)
+library(ape)
+library(ComplexHeatmap)
+library(ggnewscale)
+library(plotly)
+library(htmlwidgets)
+library(dada2)
+library(phyloseq)
+library(DECIPHER)
+
+make_theme <- function(theme_name=theme_classic() ,max_colors=0, palettefill="Pastel1", palettecolor="Dark2", modify_guide = T,
+                        setFill=TRUE, setCol=TRUE,
+                        guide_nrow=2, guide_nrow_byrow=TRUE, leg_pos="top", leg_size=12,
+                        axis_x_title = 12, axis_y_title = 12,
+                        x_angle=0 ,x_vj=0, x_hj=0, x_size=12,
+                        y_angle=0 ,y_vj=0, y_hj=0, y_size=12){
+  # This is a custom function to make plots look uniform and more easily editable
+  n_11 = c("BrBG", "PiYG", "PRGn", "PuOr", "RdBu", "RdGy", "RdYlBu", "RdYlGn", "Spectral")
+  n_12 = c("Paired", "Set3")
+  n_8 = c("Accent", "Dark2", "Pastel2", "Set2")
+  if (palettefill %in% n_12) {
+    n_f = 12
+  } else {
+    if (palettefill %in% n_11) {
+      n_f = 11
+    } else {
+      if (palettefill %in% n_8) {
+        n_f  = 8
+      } else {
+        n_f = 9
+      }
+    }
+  }
+  if (palettecolor %in% n_12) {
+    n_c = 12
+  } else {
+    if (palettecolor %in% n_11) {
+      n_c = 11
+    } else {
+      if (palettecolor %in% n_8) {
+        n_c  = 8
+      } else {
+        n_c = 9
+      }
+    }
+  }
+  getFill = colorRampPalette(brewer.pal(n_f, palettefill))
+  getColor = colorRampPalette(brewer.pal(n_c, palettecolor))
+  theme_params <- theme(axis.text.x = element_text(angle = x_angle,
+    vjust = x_vj, hjust=x_hj,
+    size = x_size),
+    axis.text.y = element_text(angle = y_angle,
+      vjust = y_vj, hjust=y_hj,
+      size = y_size),
+      axis.title.x = element_text(size=axis_x_title),
+      axis.title.y = element_text(size=axis_y_title),
+      legend.position=leg_pos,
+      legend.text = element_text(size=leg_size)
+    )
+  if (modify_guide == T) {
+    guide_params <- guides(fill = guide_legend(
+                                    nrow=guide_nrow,
+                                    byrow=guide_nrow_byrow
+                                  ),
+                          col = guide_legend(
+                                    nrow=guide_nrow,
+                                    byrow=guide_nrow_byrow
+                                  )
+                    )
+  my_theme <- list(
+                theme_name,
+                theme_params,
+                guide_params
+              )
+  } else {
+    my_theme <- list(
+                  theme_name,
+                  theme_params
+                )
+  }
+  if(setFill) {
+    if (n_f < max_colors) {
+      my_theme <- list(
+                    my_theme,
+                    scale_fill_manual(values = getFill(max_colors), na.value="grey")
+                  )
+    } else {
+      my_theme <- list(
+                    my_theme,
+                    scale_fill_brewer(palette=palettefill, na.value="grey")
+                  )
+    }
+  }
+  if(setCol) {
+    if (n_c < max_colors) {
+      my_theme <- list(
+                    my_theme,
+                    scale_color_manual(values = getColor(max_colors), na.value="grey")
+                  )
+    } else {
+      my_theme <- list(
+                    my_theme,
+                    scale_color_brewer(palette=palettecolor, na.value="grey")
+                  )
+    }
+  }
+  return(my_theme)
+}
+# use this to easily get host name
+get_host_from_sample_name <- function(sample_name){
+  if (grepl("Am", sample_name)) {
+    return("Apis mellifera")
+  }
+  if (grepl("Ac", sample_name)) {
+    return("Apis cerana")
+  }
+  if (grepl("M1.|M2.|M3.|M4.|M5.|M6.|M7.|M8.|M9.|DrY|GrY|AmAi|AmIu", sample_name)) {
+    return("Apis mellifera")
+  }
+  if (grepl("C1.|C2.|C3.|C4.|C5.|C6.|C7.|C8.|C9.|AcCh|AcKn", sample_name)) {
+    return("Apis cerana")
+  }
+  if (grepl("D1.|D2.|D3.|D4.|D5.|D6.|D7.|D8.|D9.", sample_name)) {
+    return("Apis dorsata")
+  }
+  if (grepl("F1.|F2.|F3.|F4.|F5.|F6.|F7.|F8.|F9.", sample_name)) {
+    return("Apis florea")
+  }
+  if (grepl("A1.|A2.|A3.|A4.|A5.|A6.|A7.|A8.|A9.", sample_name)) {
+    return("Apis andreniformis")
+  }
+  return(NA)
+}
+
+remove_extension <- function(x, extension) {
+  strsplit(x, extension)[[1]][[1]]
+}
+
+# set this to the location that your directory is in at the beginnning
+working_dir <- "/Users/ashadevipallujam/Documents/PacBio/20230313-PacBioSequencingTestRun/"
+# working_dir <- "/home/aiswarya/mnt/nas_recherche/spirit/D2c/aprasad/20220921_aprasad_PriorityEffectsExperimentPilot/03_PilotExperiment/07_PacBIO_sequencing"
+setwd(working_dir)
+metadata_path <- "Resources/PCR_plan.xlsx"
+samples_list <- c("M6-5", "C8-2", "D7-4", "F4-3", "A4-3") # in file names
+host_order <- c("Apis mellifera", "Apis cerana", "Apis dorsata", "Apis florea", "Apis andreniformis")
+host_order_color <- c("Apis mellifera" = brewer.pal(9, "Pastel1")[2], "Apis cerana" = brewer.pal(9, "Pastel1")[1], "Apis dorsata" = brewer.pal(9, "Pastel1")[4], "Apis florea" = brewer.pal(9, "Pastel1")[3], "Apis andreniformis" = brewer.pal(9, "Pastel1")[5])
+host_order_color_dark <- c("Apis mellifera" = brewer.pal(9, "Set1")[2], "Apis cerana" = brewer.pal(9, "Set1")[1], "Apis dorsata" = brewer.pal(9, "Set1")[4], "Apis florea" = brewer.pal(9, "Set1")[3], "Apis andreniformis" = brewer.pal(9, "Set1")[5])
+# names(df_meta_pilot)
+replace_dot <- function(x){
+  paste0(strsplit(x, "\\.")[[1]], collapse = "-")
+}
+df_meta_pilot <- read_excel(metadata_path, sheet = 1) %>%
+                  filter(Sample %in% c("M6.5", "C8.2", "D7.4", "F4.3", "A4.3")) %>%
+                    select(!c(Treatment, Number_in_batch, Extraction_batch, ID)) %>%
+                      mutate(Host = Vectorize(get_host_from_sample_name)(Sample)) %>%
+                      mutate(Sample_name = Vectorize(replace_dot)(Sample))
+# create a directory for figures and results
+system("mkdir -p Figures")
+system("mkdir -p RDS")
+system("mkdir -p database")
+system("mkdir -p 02_Dada2LengthFiltered")
+system("mkdir -p 03_Dada2Results")
+system("mkdir -p 04_PhyloseqObject")
+```
+
+# Introduction
+
+PCR amplicons were pooled as described in other directories in the project directory. Sequencing was done at the GTF, PacBio CCS. This file currently only contains example codes. It needs to be first edited before knitting.
+
+
+# Preprocessing reads
+
+
+```{r dada2}
+read_files_path <- "01_ReadsRenamed/"
+get_reads_path <- function(ID) {
+  return(paste0(read_files_path, ID, "_reads.fastq.gz"))
+}
+unfiltered_read_files <- as.character(lapply(samples_list, function(x) get_reads_path(x)))
+```
+
+## Remove primers and reorient reads
+
+First, primers must be removed and files re-oriented. The sequences of the primers can be found https://www.pacb.com/wp-content/uploads/Procedure-checklist-Amplification-of-bacterial-full-length-16S-rRNA-gene-with-barcoded-primers.pdf 
+These will have the phrase `_primers_removed` and will be placed in the folder `02_Dada2LengthFiltered`
+barcodes may have already been removed upon demultiplexing so use just the part of the primer after the barcode.
+
+```{r}
+# primer_remove_in_files = as.character(lapply(samples_list, function(x) paste0("01_ReadsRenamed/", x, "_reads.fastq.gz") ))
+# primer_remove_out_files = as.character(lapply(samples_list, function(x) paste0("02_Dada2LengthFiltered/", x, "_primers_removed.fastq.gz")))
+# f_primer <- "AGRGTTYGATYMTGGCTCAG"
+# r_primer <- "RGYTACCTTGTTACGACTT"
+# r_primer_comp <- rc(r_primer)
+# primer_removal_summary <- removePrimers(in_files, out_files,
+#               primer.fwd = f_primer,
+#               primer.rev = r_primer_comp,
+#               verbose = TRUE)
+# saveRDS(primer_removal_summary, "RDS/primer_removal_summary.rds")
+primer_removal_summary <- readRDS("RDS/primer_removal_summary.rds")
+```
+
+## Filter reads based on length
+
+### Read length distribution before
+
+The primers appear to have been removed upon CCS analysis and demultiplexing.
+The step to get read lengths takes a long time so save the output and reload for next time.
+
+```{r}
+# read_lengths <- lapply(unfiltered_read_files, function(x) nchar(getSequences(x)))
+# saveRDS(read_lengths, "RDS/read_lengths.rds")
+read_lengths <- readRDS("RDS/read_lengths.rds")
+pdf("Figures/Read_length_histogram.pdf")
+hist(do.call(c, read_lengths), 100)
+dev.off()
+hist(do.call(c, read_lengths), 100)
+```
+
+### Filtering by length
+
+We expect and amplicon size in the range of 1500. So make a cut-off of 1000 minimum and 1600 maximum.
+This has already bee performed and will not be repeated when knitting.
+
+```{r}
+filt_read_files <- as.character(lapply(samples_list, function(x) paste0("02_Dada2LengthFiltered/", x, "_filt_reads.fastq.gz")))
+# trimming_summary <- filterAndTrim(primer_remove_out_files, filt_read_files, minLen=1000, maxLen=1600, rm.phix=FALSE, multithread=T)
+# saveRDS(trimming_summary, "RDS/trimming_summary.rds")
+trimming_summary <- readRDS("RDS/trimming_summary.rds")
+```
+
+### Read length distribution after
+
+```{r}
+# read_lengths_filt <- lapply(filt_read_files, function(x) nchar(getSequences(x)))
+# saveRDS(read_lengths_filt, "RDS/read_lengths_filt.rds")
+read_lengths_filt <- readRDS("RDS/read_lengths_filt.rds")
+pdf("Figures/Read_length_filtered_histogram.pdf")
+hist(do.call(c, read_lengths_filt), 100)
+dev.off()
+hist(do.call(c, read_lengths_filt), 100)
+```
+
+## Dada2 quality plots
+
+```{r}
+plotQualityProfile(filt_read_files[1:5])
+```
+
+
+
+## Dereplicate and learn errors
+
+
+```{r}
+# derepd <- derepFastq(filt_read_files, verbose = T)
+# errors <- learnErrors(derepd, errorEstimationFunction=PacBioErrfun, BAND_SIZE=32, multithread=TRUE)
+# saveRDS(errors, "RDS/errors.rds")
+errors <- readRDS("RDS/errors.rds")
+plotErrors(errors)
+# dada2 <- dada(derepd, err=errors, BAND_SIZE=32, multithread=T)
+# saveRDS(dada2, "RDS/dada2.rds")
+dada2 <- readRDS("RDS/dada2.rds")
+seqtable <- makeSequenceTable(dada2); dim(seqtable)
+seqtable_nochim <- removeBimeraDenovo(seqtable, method = "consensus", multithread = TRUE, verbose = TRUE); dim(seqtable)
+sum(seqtable_nochim)/sum(seqtable)
+```
+
+## Summarise pre-processing
+
+```{r}
+df_summary <- primer_removal_summary %>% as.data.frame() %>%
+                mutate(ID = Vectorize(remove_extension)(rownames(.), "_reads.fastq.gz")) %>%
+                   pivot_longer(!ID, values_to = "reads", names_to = "type") %>%
+                    mutate(type = ifelse(type == "reads.in", "0_Raw.reads", "1_Primer.removed")) %>%
+                      left_join(df_meta_pilot, by = c("ID" = "Sample")) %>%
+                        mutate(Host = Vectorize(get_host_from_sample_name)(ID))
+
+df_summary_trimming <- trimming_summary %>% as.data.frame %>% 
+                                  mutate(ID = Vectorize(remove_extension)(rownames(.), "_primers_removed.fastq.gz")) %>%
+                                  pivot_longer(!ID, values_to = "reads", names_to = "type") %>%
+                                  mutate(type = ifelse(type == "reads.in", "Trimming.in", "2_Trimmed")) %>%
+                                  left_join(df_meta_pilot, by = c("ID" = "Sample")) %>%
+                                  mutate(Host = Vectorize(get_host_from_sample_name)(ID)) %>%
+                                  filter(type != "Trimming.in")
+
+dada_denoise_summary <- data.frame("V1" = sapply(dada2, function(x) sum(getUniques(x))) %>% as.matrix) %>%
+                          mutate("4_Denoised" = V1) %>% select(!V1) %>%
+                          cbind("5_No.chimera" = rowSums(seqtable_nochim)) %>%
+                          mutate(ID = Vectorize(remove_extension)(rownames(.), "_filt_reads.fastq.gz")) %>%
+                            pivot_longer(!ID, values_to = "reads", names_to = "type")
+
+df_summary <- bind_rows(rbind(df_summary, df_summary_trimming), dada_denoise_summary)
+
+ggplot() +
+  geom_bar(data = df_summary,
+           aes(y = factor(ID, samples_list),
+               x = reads,
+               fill = type,
+               group = type
+           ), color = "black",
+           stat = "identity", position = "dodge"
+  ) +
+  labs(x = "Number of reads", y = "Sample", fill = "Preprocessing step") +
+    make_theme(setFill = T, setCol = F)
+```
+
+```{r}
+# seqtable_out <- seqtable %>% as.data.frame %>%
+#            rownames_to_column("Sample") %>%
+#            mutate(Sample = Vectorize(remove_extension)(Sample, "_filt_reads.fastq.gz")) %>%
+#              column_to_rownames("Sample") %>%
+#              as.matrix()
+# seqtable_out_vis <- seqtable_out
+# colnames(seqtable_out_vis) <- seq(1, length(colnames(seqtable_out)))
+# seqtable_out_pilot <- seqtable_out %>%
+#                        as.data.frame %>%
+#                          filter(row.names(.) %in% samples_list)
+# dim(seqtable_out_vis_pilot[, colSums(seqtable_out_vis_pilot != 0) > 1])[[2]]
+# seqtable_out_pilot <- seqtable_out_pilot[, colSums(seqtable_out_pilot != 0) > 0]
+# dim(seqtable_out_pilot)
+# write.csv(file="03_Dada2Results/ASVs_pilot_samples.csv", seqtable_out_pilot)
+
+# OTU clustering - skip
+# possible to cluster into OTUs consider the code below for this
+# nproc = 6
+# seqtab <- seqtable_out_pilot
+# asv_sequences <- colnames(seqtab)
+# sample_names <- rownames(seqtab)
+# dna <- Biostrings::DNAStringSet(asv_sequences)
+# # ## Find clusters of ASVs to form the new OTUs
+# # aln <- DECIPHER::AlignSeqs(dna, processors = nproc)
+# # d <- DECIPHER::DistanceMatrix(aln, processors = nproc)
+# #  Clusterize(seqs, cutoff=seq(0.5, 0, -0.1), processors=1)
+# clusters <- Clusterize(
+#   dna, 
+#   method = "shortest",
+#   cutoff = 0.01, # use `cutoff = 0.0` for a 97% OTU 
+#   processors = nproc)
+# clusters
+# ## Use dplyr to merge the columns of the seqtab matrix for ASVs in the same OTU
+# # prep by adding sequences to the `clusters` data frame
+# clusters <- clusters %>%
+#   add_column(sequence = asv_sequences)
+# merged_seqtab <- seqtab %>%
+#   # setup: turn seqtab into a tibble with rows = ASVs and columns = samples
+#   t %>%
+#   as_tibble(rownames = "sequence") %>%
+#   # add the cluster information
+#   left_join(clusters, by = "sequence") %>%
+#   # merge ASVs in the same cluster, summing abundances within samples
+#   group_by(cluster) %>%
+#   mutate_at(vars(-sequence), sum) %>%
+#   # # Set new taxa names to OTU<cluster #> 
+#   # mutate(cluster = paste0("OTU", cluster)) %>%
+#   # convert back to a matrix in the original orientation
+#   column_to_rownames("sequence") %>%
+#   as("matrix") %>%
+#  t
+# write.csv(file="03_Dada2Results/ASVs_pilot_samples.csv", merged_seqtab)
+```
+
+# Assign Taxonomy
+
+Download Silva full-length database into database directory.
+
+
+```{r}
+system("wget https://zenodo.org/record/3986799/files/silva_nr99_v138_wSpecies_train_set.fa.gz  -O database/silva_nr99_v138_wSpecies_train_set.fa.gz")
+system("wget https://zenodo.org/record/3986799/files/silva_nr99_v138_wSpecies_train_set.fa.gz  -O database/silva_nr99_v138_train_set.fa.gz")
+system("wget https://zenodo.org/record/3986799/files/silva_species_assignment_v138.fa.gz  -O database/silva_species_assignment_v138.fa.gz")
+
+silva_DB_assignTax <- "database/silva_nr99_v138_wSpecies_train_set.fa.gz"
+silva_DB_assignSpec <- "database/silva_species_assignment_v138.fa.gz"
+
+seqtable <- makeSequenceTable(dada2); dim(seqtable)
+seqtable_out <- seqtable %>% as.data.frame %>%
+            rownames_to_column("ID") %>%
+            mutate(ID = Vectorize(remove_extension)(ID, "_filt_reads.fastq.gz")) %>%
+              column_to_rownames("ID") %>%
+              as.matrix()
+# taxonomy <- assignTaxonomy(seqtable, silva_DB_assignTax, minBoot = 80, multithread=TRUE, verbose = TRUE)
+# saveRDS(taxonomy, "RDS/taxonomy_before_species_assigned.RDS")
+# taxonomy <- readRDS("RDS/taxonomy.RDS")
+# taxonomy_spec <- addSpecies(taxonomy, silva_DB_assignSpec, allowMultiple = T, verbose = T)
+# saveRDS(taxonomy_spec, "RDS/taxonomy_spec.RDS")
+# taxonomy_spec <- readRDS("RDS/taxonomy_spec.RDS")
+# write.csv(file="03_Dada2Results/Taxtable.csv", taxonomy_spec)
+# write.csv(file="03_Dada2Results/ASV_counts.csv", seqtable_out)
+```
+
+# Taxonomy assignment
+
+```{r}
+head(taxonomy)
+head(taxonomy_spec)
+taxonomy_df <- taxonomy %>% as.data.frame()
+
+get_number_assigned <- function(rank_name) {
+  if (rank_name == "Total") {
+    return(dim(taxonomy_df)[[1]])
+  } else {
+    num_ASVs <- dim(taxonomy_df[rank_name])[[1]] - sum(is.na(taxonomy_df[rank_name]))
+    return(num_ASVs)
+  }
+}
+
+ranks_assigned_df <- data.frame(rank = c("Total", colnames(taxonomy_df))) %>%
+                        mutate(num_ASVs = Vectorize(get_number_assigned)(rank))
+
+ggplot() +
+  geom_bar(data = ranks_assigned_df,
+           aes(x = factor(rank, c("Total", colnames(taxonomy_df))),
+               y = num_ASVs,
+               fill = factor(rank, c("Total", colnames(taxonomy_df)))
+           ), stat = "identity"
+          ) +
+    labs(x = "Rank", y = "Number of ASVs", fill = "Rank") +
+      make_theme()
+
+ggplot() +
+  geom_bar(data = taxonomy_df,
+           aes(x = Kingdom,
+               fill = Kingdom
+           ), stat = "count"
+          ) +
+    labs(x = "Kingdom", y = "Number of ASVs", fill = "Kingdom") +
+      make_theme()
+
+ggplot() +
+  geom_bar(data = taxonomy_df,
+           aes(x = Phylum,
+               fill = Phylum
+           ), stat = "count"
+          ) +
+    labs(x = "Phylum", y = "Number of ASVs", fill = "Phylum") +
+      make_theme(x_angle = 30)
+
+ggplot() +
+  geom_bar(data = taxonomy_df,
+           aes(x = Family,
+               fill = Family
+           ), stat = "count"
+          ) +
+    labs(x = "Family", y = "Number of ASVs", fill = "Family") +
+      make_theme(x_angle = 30, x_vj = 1, x_hj = 1, 
+                 guide_nrow = 4,
+                 x_size = 7,
+                 leg_size = 6,
+                 max_colors = length(unique(taxonomy_df$Family)))
+
+ggplot() +
+  geom_bar(data = taxonomy_df %>% filter(!grepl("Lacto|Bifido|Nei|Orb", Family)) %>% filter(!is.na(Family)),
+           aes(x = Family,
+               fill = Family
+           ), stat = "count"
+          ) +
+    labs(x = "Family", y = "Number of ASVs", fill = "Family") +
+      make_theme(x_angle = 30, x_vj = 1, x_hj = 1, 
+                 guide_nrow = 4,
+                 x_size = 7,
+                 leg_size = 6,
+                 max_colors = length(unique(taxonomy_df$Family)) - 4
+                )
+```
+
+
+# Phyloseq
+
+```{r}
+# samples_df <- df_meta_pilot %>% filter(!is.na(Sample)) %>%
+#                 mutate(Sample = ifelse(Sample == "M6.5", "M6-5", Sample)) %>%
+#                 mutate(Sample = ifelse(Sample == "C8.2", "C8-2", Sample)) %>%
+#                 mutate(Sample = ifelse(Sample == "D7.4", "D7-4", Sample)) %>%
+#                 mutate(Sample = ifelse(Sample == "F4.3", "F4-3", Sample)) %>%
+#                 mutate(Sample = ifelse(Sample == "A4.3", "A4-3", Sample)) %>%
+#                 column_to_rownames("Sample")
+# taxonomy_mat <- read.table("03_Dada2Results/Taxtable.csv", sep = ",",header=T) %>%
+#                     column_to_rownames("X") %>%
+#                       as.matrix()
+# otu_mat <- seqtable %>% as.data.frame %>%
+#             rownames_to_column("ID") %>%
+#             mutate(ID = Vectorize(remove_extension)(ID, "_filt_reads.fastq.gz")) %>%
+#               column_to_rownames("ID") %>%
+#               as.matrix()
+# ps_raw <- phyloseq(otu_table(otu_mat, taxa_are_rows=F), 
+#                sample_data(samples_df), 
+#                tax_table(taxonomy_mat))
+# 
+# dna <- Biostrings::DNAStringSet(taxa_names(ps_raw))
+# names(dna) <- taxa_names(ps_raw)
+# 
+# ps_raw <- merge_phyloseq(ps_raw, dna)
+# taxa_names(ps_raw) <- paste0("ASV", seq(ntaxa(ps_raw)))
+# ps <- ps_raw
+# 
+# table = merge(tax_table(ps),t(otu_table(ps)), by="row.names")
+# write.table(table, "04_PhyloseqObject/ASVtable.txt", sep="\t", row.names = F)
+#
+# # Export to FASTA with Biostrings
+# Biostrings::writeXStringSet(refseq(ps), "04_PhyloseqObject/phyloseq_ASVs.fasta",append=FALSE, format="fasta")
+
+#save Phyloseq object
+# saveRDS(ps, '04_PhyloseqObject/PhyloSeq_Object.rds')
+
+#Check that you can import it
+ps <- readRDS("04_PhyloseqObject/PhyloSeq_Object.rds")
+```
+
+
+```{r phy}
+ps_rel <- transform_sample_counts(ps_raw, function(x) x / sum(x) )
+abundant_taxa <- taxa_sums(ps_rel)[which(taxa_sums(ps_rel) > 0.005)]
+ps_abundant_taxa <- prune_taxa(names(abundant_taxa), ps_rel)
+plot_bar(ps_abundant_taxa, fill = "Genus")
+```
+```{r}
+genusColors <- c("Bombilactobacillus" = head(colorRampPalette(c(brewer.pal(11, "Spectral")[1], "#FFFFFF"))(10), -1)[1],
+                    "Lactobacillus" = head(colorRampPalette(c(brewer.pal(11, "Spectral")[1], "#FFFFFF"))(10), -1)[4],
+                    "Bifidobacterium" = brewer.pal(11, "Spectral")[3],
+                    "Gilliamella" = brewer.pal(11, "Spectral")[11],
+                    "Frischella" = brewer.pal(11, "Spectral")[8],
+                    "Bartonella" = brewer.pal(11, "Spectral")[7],
+                    "Snodgrassella" = brewer.pal(11, "Spectral")[10],
+                    "Apibacter" = brewer.pal(11, "Spectral")[4],
+                    "Commensalibacter" = brewer.pal(11, "Spectral")[6],
+                    "Bombella" = brewer.pal(11, "Spectral")[5],
+                    "Apilactobacillus" = brewer.pal(11, "Spectral")[9],
+                    "Dysgonomonas" = brewer.pal(11, "Spectral")[2],
+                    "Spiroplasma" = brewer.pal(8, "Set1")[8],
+                    "WRHT01" = brewer.pal(8, "Dark2")[3],
+                    "Pectinatus" = brewer.pal(8, "Dark2")[1],
+                    "Enterobacter" = head(colorRampPalette(c(brewer.pal(11, "BrBG")[2], "#FFFFFF"))(10), -1)[1],
+                    "Zymobacter" = head(colorRampPalette(c(brewer.pal(11, "BrBG")[2], "#FFFFFF"))(10), -1)[2],
+                    "Entomomonas"= head(colorRampPalette(c(brewer.pal(11, "BrBG")[2], "#FFFFFF"))(10), -1)[4],
+                    "Saezia" = head(colorRampPalette(c(brewer.pal(11, "BrBG")[2], "#FFFFFF"))(10), -1)[6],
+                    "Parolsenella" = head(colorRampPalette(c(brewer.pal(11, "BrBG")[2], "#FFFFFF"))(10), -1)[8]
+)
+
+extend_colors <- function(names_vec, colors_vec, greys = T, pal = "Pastel1"){
+  final_list <- c()
+  if (greys) {
+     for (a_name in names_vec) {
+      if (a_name %in% names(colors_vec)) {
+        final_list[a_name] = colors_vec[a_name]
+      } else {
+        final_list[a_name] = "grey"
+      }
+    }
+  } else {
+    i = 1
+    num_new_cols = length(names_vec[which(!(names_vec %in% names(colors_vec)))])
+    for (a_name in names_vec) {
+      if (a_name %in% names(colors_vec)) {
+        final_list[a_name] = colors_vec[a_name]
+      } else {
+        if (num_new_cols > 9) {
+         final_list[a_name] = colorRampPalette(brewer.pal(9, pal))(num_new_cols)[i] 
+        } else {
+          final_list[a_name] = brewer.pal(num_new_cols, pal)[i] 
+        }
+        i = i + 1
+      }
+    }
+  }
+  return(final_list) 
+}
+
+```
+
+```{r}
+ASV_counts_df <- psmelt(ps_raw) %>%
+  group_by(Sample) %>%
+  mutate(Percentage = Abundance/sum(Abundance)) %>%
+  mutate(Species = paste0(Genus, " ", Species))
+
+Species_counts_df <- ASV_counts_df %>%
+                      group_by(Species, Sample) %>%
+                      mutate(Abundance = sum(Abundance), Percentage = sum(Percentage)) %>%
+                      reframe(Sample, Genus, Species, Percentage, Abundance) %>%
+                      unique()
+
+ggplot() +
+  geom_bar(data = ASV_counts_df,
+           aes(x = Sample,
+               y = Abundance,
+               fill = Genus),
+           stat = "identity", position = "stack"
+           ) +
+  labs(x = "Sample", y = "Count", fill = "Genus") +
+  scale_fill_manual(values = extend_colors(unique(ASV_counts_df$Genus), genusColors, greys = F)) +
+    make_theme(setFill = F, leg_size = 7, guide_nrow = 3
+      )
+
+ggplot() +
+  geom_bar(data = ASV_counts_df,
+           aes(x = Sample,
+               y = Percentage,
+               fill = Genus),
+           stat = "identity", position = "stack"
+           ) +
+  labs(x = "Sample", y = "Count", fill = "Genus") +
+  scale_fill_manual(values = extend_colors(unique(ASV_counts_df$Genus), genusColors, greys = F)) +
+    make_theme(setFill = F, leg_size = 7, guide_nrow = 3
+      )
+
+ggplot() +
+  geom_bar(data = ASV_counts_df %>% filter(Percentage > 0.001),
+           aes(x = Sample,
+               y = Percentage,
+               fill = Genus),
+           stat = "identity", position = "stack"
+           ) +
+  labs(x = "Sample", y = "Count", fill = "Genus") +
+  scale_fill_manual(values = extend_colors(unique(ASV_counts_df$Genus), genusColors, greys = F)) +
+    make_theme(setFill = F, leg_size = 7, guide_nrow = 3
+      )
+
+ggplot() +
+  geom_bar(data = ASV_counts_df %>% filter(!is.na(Genus)),
+           aes(x = Sample,
+               y = Percentage,
+               fill = Genus),
+           stat = "identity", position = "stack"
+           ) +
+  labs(x = "Sample", y = "Count", fill = "Genus") +
+  scale_fill_manual(values = extend_colors(unique(ASV_counts_df$Genus), genusColors, greys = F)) +
+    make_theme(setFill = F, leg_size = 7, guide_nrow = 3
+      )
+```
+```{r}
+ggplot() +
+  geom_bar(data = ASV_counts_df %>% filter(Abundance > 100),
+           aes(x = Sample,
+               y = Abundance,
+               fill = Genus),
+           stat = "identity", position = "stack"
+           ) +
+  labs(x = "Sample", y = "Count", fill = "Genus") +
+  scale_fill_manual(values = extend_colors(unique(ASV_counts_df$Genus), genusColors, greys = F)) +
+    make_theme(setFill = F, leg_size = 7, guide_nrow = 3
+      )
+
+ggplot() +
+  geom_bar(data = Species_counts_df %>% filter(Abundance > 10) %>% filter(!is.na(Genus)),
+           aes(x = Sample,
+               y = Abundance,
+               fill = Genus), color = "black",
+           stat = "identity", position = "stack", linewidth = 0.2
+           ) +
+  labs(x = "Sample", y = "Count", fill = "Genus") +
+  scale_fill_manual(values = extend_colors(unique(ASV_counts_df$Genus), genusColors, greys = F)) +
+    make_theme(setFill = F, leg_size = 6, leg_pos = "bottom", guide_nrow = 6, palettefill = "Pastel1",
+               max_colors = length(unique(Species_counts_df$Species))
+      )
+
+ggplot() +
+  geom_bar(data = Species_counts_df %>% filter(Abundance > 10),
+           aes(x = Sample,
+               y = Percentage,
+               fill = Genus), color = "black",
+           stat = "identity", position = "stack", linewidth = 0.2
+           ) +
+  labs(x = "Sample", y = "Count", fill = "Genus") +
+  scale_fill_manual(values = extend_colors(unique(ASV_counts_df$Genus), genusColors, greys = F)) +
+    make_theme(setFill = F, leg_size = 6, leg_pos = "bottom", guide_nrow = 6, palettefill = "Pastel1",
+               max_colors = length(unique(Species_counts_df$Species))
+      )
+
+
+p <- ggplot() +
+  geom_bar(data = Species_counts_df %>% filter(Abundance > 10) %>% filter(!is.na(Genus)),
+           aes(x = Sample,
+               y = Percentage,
+               fill = Species), color = "black",
+           stat = "identity", position = "stack", linewidth = 0.2
+           ) +
+  labs(x = "Sample", y = "Count", fill = "Genus") +
+  # scale_fill_manual(values = extend_colors(unique(ASV_counts_df$Genus), genusColors, greys = F)) +
+    make_theme(setFill = T, leg_size = 6, leg_pos = "bottom", guide_nrow = 6, palettefill = "Pastel1",
+               max_colors = length(unique(Species_counts_df$Species))
+      )
+ggplotly(p)
+```
+
+```{r}
+ASV_counts_df <- psmelt(ps_raw) %>%
+  group_by(Sample) %>%
+  mutate(Percentage = Abundance/sum(Abundance)) %>%
+  mutate(Species = paste0(Genus, " ", Species))
+
+Genus_counts_df <- ASV_counts_df %>%
+                    group_by(Genus, Sample) %>%
+                    mutate(Abundance = sum(Abundance), Percentage = sum(Percentage))
+
+Family_counts_df <- ASV_counts_df %>%
+                    group_by(Family, Sample) %>%
+                    mutate(Abundance = sum(Abundance), Percentage = sum(Percentage))
+
+Phylum_counts_df <- ASV_counts_df %>%
+                    group_by(Phylum, Sample) %>%
+                    mutate(Abundance = sum(Abundance), Percentage = sum(Percentage))
+
+Species_counts_df <- ASV_counts_df %>%
+                      group_by(Species, Sample) %>%
+                      mutate(Abundance = sum(Abundance), Percentage = sum(Percentage)) %>%
+                      reframe(Sample, Genus, Species, Percentage, Abundance) %>%
+                      unique()
+
+
+counts_df <- Species_counts_df %>%
+              select(!c(Abundance, Genus)) %>%
+              rowid_to_column() %>%
+                pivot_wider(!rowid, values_from = Percentage, names_from = Species)
+heatmap(counts_df %>% column_to_rownames("Sample") %>% as.matrix() %>% t)
+
+ggplot() +
+  geom_tile(data = Species_counts_df %>% filter(!is.na(Genus)),
+            aes(x = Sample,
+                y = Species,
+                fill = Percentage)
+            ) +
+  scale_fill_gradient2(low = brewer.pal(8, "YlGn")[1], mid = brewer.pal(8, "YlGn")[3], high = brewer.pal(8, "YlGn")[6], midpoint = 0.15) +
+  make_theme(setFill = F, guide_nrow =1)
+
+
+genusOrder<- c("Lactobacillus", "Bifidobacterium", "Snodgrassella", "Gilliamella", "Bartonella", "Frischella", "Apibacter", "Dysgonomonas", "Pectinatus", "Atopobium", "Commensalibacter", "Escherichia-Shigella", "Paludibacterium")
+
+ggplot() +
+  geom_tile(data = Phylum_counts_df,
+            aes(x = Sample,
+                y = Phylum,
+                fill = Percentage)
+            ) +
+  scale_fill_gradient2(low = "#ffffff", mid = brewer.pal(8, "YlGn")[4], high = brewer.pal(8, "YlGn")[6]) +
+  make_theme(setFill = F, guide_nrow =1)
+```
